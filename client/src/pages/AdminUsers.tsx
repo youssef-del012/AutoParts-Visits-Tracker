@@ -276,6 +276,7 @@ export default function AdminUsers() {
       name: u.name ?? "",
       email: u.email ?? "",
       role: u.role,
+      os: u.os ?? "android",
     });
     setShowEditPassword(false);
     setEditOpen(true);

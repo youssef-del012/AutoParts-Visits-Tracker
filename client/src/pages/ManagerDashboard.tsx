@@ -20,8 +20,8 @@ export default function ManagerDashboard() {
   const photoUrl = managerProfile?.photoUrl ?? null;
 
   // ── البيانات الحقيقية من السيرفر ────────────────────────────────────────────
-  const { data: visitsData } = trpc.visit.myHistory.useQuery({ limit: 200, offset: 0 });
-  const { data: branches = [] } = trpc.manager.getMyBranches.useQuery();
+  const { data: visitsData } = trpc.visit.myHistory.useQuery({ limit: 200, offset: 0 }, { staleTime: 30_000 });
+  const { data: branches = [] } = trpc.manager.getMyBranches.useQuery(undefined, { staleTime: 5 * 60 * 1000 });
 
   // مؤقت حي لتحديث مدة الزيارة الحالية كل دقيقة
   const [now, setNow] = useState(() => Date.now());
@@ -38,7 +38,7 @@ export default function ManagerDashboard() {
   const todayVisits = visits.filter((v) => new Date(v.checkInAt) >= todayStart);
   const visitsToday = todayVisits.length;
   const distanceTodayKm = todayVisits.reduce(
-    (acc, v) => acc + (parseFloat(v.distanceToPrevBranchKm) || 0),
+    (acc, v) => acc + (v.distanceToPrevBranchKm != null ? parseFloat(v.distanceToPrevBranchKm) : 0),
     0
   );
   const targetCount = Math.max(branches.length, 1);
@@ -288,10 +288,14 @@ export default function ManagerDashboard() {
               display: "block",
               margin: "0 24px 20px",
               padding: "18px 20px",
-              background: activeVisit.status === 'checked_in'
-                ? "linear-gradient(135deg, rgba(52,211,153,0.15) 0%, rgba(30,34,40,0.9) 100%)"
-                : "rgba(30,34,40,0.8)",
-              border: "1px solid rgba(52,211,153,0.4)",
+              background: activeVisit.visitType === "external_mission"
+                ? "linear-gradient(135deg, rgba(139,92,246,0.18) 0%, rgba(30,34,40,0.9) 100%)"
+                : activeVisit.status === 'checked_in'
+                  ? "linear-gradient(135deg, rgba(52,211,153,0.15) 0%, rgba(30,34,40,0.9) 100%)"
+                  : "rgba(30,34,40,0.8)",
+              border: activeVisit.visitType === "external_mission"
+                ? "1px solid rgba(139,92,246,0.4)"
+                : "1px solid rgba(52,211,153,0.4)",
               borderRadius: 20,
               textDecoration: "none",
               color: "#fff",
@@ -305,19 +309,33 @@ export default function ManagerDashboard() {
                 className="relative flex h-3 w-3"
                 style={{ flexShrink: 0 }}
               >
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#34d399] opacity-75" />
-                <span className="relative inline-flex rounded-full h-3 w-3 bg-[#34d399]" />
+                <span
+                  className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75"
+                  style={{ background: activeVisit.visitType === "external_mission" ? "#8b5cf6" : "#34d399" }}
+                />
+                <span
+                  className="relative inline-flex rounded-full h-3 w-3"
+                  style={{ background: activeVisit.visitType === "external_mission" ? "#8b5cf6" : "#34d399" }}
+                />
               </span>
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginBottom: 4 }}>
-                  زيارتك الحالية — داخل النطاق
+                  {activeVisit.visitType === "external_mission"
+                    ? "مأمورية خارجية جارية"
+                    : "زيارتك الحالية — داخل النطاق"}
                 </div>
                 <div style={{ fontSize: 16, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                  {activeVisit.branchName}
+                  {activeVisit.visitType === "external_mission"
+                    ? (activeVisit.notes ? activeVisit.notes.slice(0, 40) : "مأمورية خارجية")
+                    : (activeVisit.branchName ?? "فرع غير محدد")}
                 </div>
               </div>
               <div style={{ textAlign: "center", flexShrink: 0 }}>
-                <div style={{ fontSize: 18, fontWeight: 800, color: "#34d399" }}>
+                <div style={{
+                  fontSize: 18,
+                  fontWeight: 800,
+                  color: activeVisit.visitType === "external_mission" ? "#8b5cf6" : "#34d399",
+                }}>
                   {activeVisitDuration}
                 </div>
                 <div style={{ fontSize: 10, color: "rgba(255,255,255,0.5)" }}>منذ الدخول</div>

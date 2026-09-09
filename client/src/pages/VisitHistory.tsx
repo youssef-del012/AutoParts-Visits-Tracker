@@ -21,8 +21,11 @@ export default function VisitHistory() {
   const { data: visitsData, isLoading } = trpc.visit.myHistory.useQuery({
     limit: PAGE_SIZE,
     offset,
-  });
+  }, { staleTime: 30_000 });
   const total = visitsData?.total ?? 0;
+  // ✅ عدّادات التبويبات جاية من السيرفر (conditional counts) — مش من الصفحات المحمّلة بس
+  const activeCount = visitsData?.activeCount ?? 0;
+  const doneCount = visitsData?.doneCount ?? 0;
 
   // نراكم الصفحات بدل ما نستبدلها — عشان "تحميل المزيد" يضيف صفوف مش يمسحها
   const [allVisits, setAllVisits] = useState<any[]>([]);
@@ -174,10 +177,10 @@ export default function VisitHistory() {
             الكل ({total})
           </button>
           <button className={`tab ${tab === "active" ? "active" : ""}`} onClick={() => setTab("active")}>
-            جارية ({allVisits.filter((v) => v.status === "checked_in").length})
+            جارية ({activeCount})
           </button>
           <button className={`tab ${tab === "done" ? "active" : ""}`} onClick={() => setTab("done")}>
-            منتهية ({allVisits.filter((v) => v.status === "checked_out").length})
+            منتهية ({doneCount})
           </button>
         </div>
 
@@ -204,14 +207,24 @@ export default function VisitHistory() {
               return (
                 <div key={visit.id} className="history-item">
                   <div className="no-photo-icon">
-                    <span className="material-symbols-outlined" style={{ fontSize: 22, color: 'rgba(255,255,255,0.25)' }}>store</span>
+                    <span
+                      className="material-symbols-outlined"
+                      style={{
+                        fontSize: 22,
+                        color: visit.visitType === "external_mission"
+                          ? "rgba(139,92,246,0.7)"
+                          : "rgba(255,255,255,0.25)",
+                      }}
+                    >
+                      {visit.visitType === "external_mission" ? "explore" : "store"}
+                    </span>
                   </div>
                   <div className="item-details">
                     <h4>{visit.branchName ?? "مأمورية خارجية"}</h4>
                     <p>
                       {format(checkInTime, "EEEE d MMMM", { locale: ar })}
                       {durationMin !== null && ` • ${durationMin >= 60 ? `${Math.floor(durationMin / 60)} س ${durationMin % 60} د` : `${durationMin} دقيقة`}`}
-                      {visit.distanceToPrevBranchKm && ` • ${(parseFloat(visit.distanceToPrevBranchKm)).toFixed(1)} كم`}
+                      {visit.distanceToPrevBranchKm != null && ` • ${parseFloat(visit.distanceToPrevBranchKm).toFixed(1)} كم`}
                     </p>
                     <div>
                       {visit.visitType === "external_mission" && (

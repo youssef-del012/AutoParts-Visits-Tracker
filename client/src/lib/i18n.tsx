@@ -125,6 +125,16 @@ const en: Dict = {
   "reports.statusIn": "Inside",
   "reports.statusOut": "Left",
   "reports.notes": "Notes",
+  "reports.openLocation": "Open location",
+  "reports.nearestBranch": "Nearest branch",
+  // ── External mission approval ──
+  "reports.approvalStatus": "Review status",
+  "reports.pending": "Pending review",
+  "reports.approved": "Approved",
+  "reports.rejected": "Rejected",
+  "reports.approve": "Approve",
+  "reports.reject": "Reject",
+  "reports.pendingFilter": "Pending review only",
 
   // ── Mock reasons ──
   "reason.teleportation": "Implausible jump (impossible distance/time)",
@@ -330,6 +340,14 @@ const en: Dict = {
   "live.noLocationData": "No location data",
   "live.disclaimer": "Location shown is the last known position, not necessarily real-time.",
   "live.unnamedManager": "Manager",
+  // ── Route history (history mode) ──
+  "live.startPoint": "Start point",
+  "live.endPoint": "End point",
+  "live.stoppedFor": "⏱ {n} min",
+  "live.totalDistance": "Distance",
+  "live.stopsCount": "Stops",
+  "live.duration": "Duration",
+  "live.pointsCount": "Points",
 };
 
 const ar: Dict = {
@@ -441,6 +459,16 @@ const ar: Dict = {
   "reports.statusIn": "داخل",
   "reports.statusOut": "غادر",
   "reports.notes": "ملاحظات",
+  "reports.openLocation": "فتح الموقع",
+  "reports.nearestBranch": "أقرب فرع",
+  // ── اعتماد المأموريات الخارجية ──
+  "reports.approvalStatus": "حالة المراجعة",
+  "reports.pending": "قيد المراجعة",
+  "reports.approved": "معتمدة",
+  "reports.rejected": "مرفوضة",
+  "reports.approve": "موافقة",
+  "reports.reject": "رفض",
+  "reports.pendingFilter": "قيد المراجعة (pending)",
 
   // ── Mock reasons ──
   "reason.teleportation": "انتقال غير منطقي (مسافة/وقت مستحيل)",
@@ -646,6 +674,14 @@ const ar: Dict = {
   "live.noLocationData": "لا توجد بيانات موقع",
   "live.disclaimer": "الموقع المعروض هو آخر موقع معروف، وليس بالضرورة لحظياً.",
   "live.unnamedManager": "مدير",
+  // ── سجل المسار (وضع السجل) ──
+  "live.startPoint": "نقطة البداية",
+  "live.endPoint": "نقطة النهاية",
+  "live.stoppedFor": "⏱ {n} د",
+  "live.totalDistance": "المسافة",
+  "live.stopsCount": "التوقفات",
+  "live.duration": "المدة",
+  "live.pointsCount": "النقاط",
 };
 
 const dict: Record<Lang, Dict> = { en, ar };

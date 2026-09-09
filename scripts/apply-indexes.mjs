@@ -21,6 +21,7 @@ if (!DATABASE_URL) {
 const INDEXES = [
   { table: "visits", name: "idx_visits_manager_checkin", columns: "(managerId, checkInAt)" },
   { table: "visits", name: "idx_visits_manager_status", columns: "(managerId, status)" },
+  { table: "visits", name: "idx_visits_checkin_at", columns: "(checkInAt)" },
   { table: "locationLogs", name: "idx_locationLogs_manager_timestamp", columns: "(managerId, timestamp)" },
   { table: "managerBranches", name: "idx_managerBranches_manager", columns: "(managerId)" },
 ];

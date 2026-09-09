@@ -94,6 +94,17 @@ export const visits = mysqlTable("visits", {
   visitType: mysqlEnum("visitType", ["branch", "external_mission"]).default("branch").notNull(),
   // noteType: short_visit = سبب الزيارة القصيرة، non_primary = سبب زيارة فرع غير أساسي
   noteType: mysqlEnum("noteType", ["general", "short_visit", "non_primary", "external_mission"]).default("general").notNull(),
+  // ── نطاق المأمورية الخارجية التلقائي (جيوفنس) ──────────────────────────────
+  // مركز المأمورية ونصف قطرها بالمتر — يُخزن عند checkIn لمأمورية external_mission فقط
+  // ويُستخدم للخروج التلقائي لما المدير يخرج من نطاق المأمورية
+  missionLatitude: text("missionLatitude"),
+  missionLongitude: text("missionLongitude"),
+  missionRadiusMeters: int("missionRadiusMeters").default(200),
+  // ── أقرب فرع للمأمورية الخارجية — يُخزن عند checkIn لمأمورية external_mission فقط ──
+  // ليعرف الأدمن أقرب فرع للإحداثيات المسجلة ومدى بعدها عنه
+  nearestBranchId: int("nearestBranchId"),
+  nearestBranchName: varchar("nearestBranchName", { length: 255 }),
+  nearestBranchDistanceKm: decimal("nearestBranchDistanceKm", { precision: 8, scale: 2 }),
   checkInAt: timestamp("checkInAt").defaultNow().notNull(),
   checkOutAt: timestamp("checkOutAt"),
   latitudeIn: text("latitudeIn").notNull(),
@@ -117,12 +128,20 @@ export const visits = mysqlTable("visits", {
   // مثال: ["DEVELOPER_OPTIONS_ON", "ACCURACY_PERFECT_INTEGER", "SENSOR_STATIONARY"]
   mockReasons: text("mockReasons"),
 
+  // ── اعتماد المأموريات الخارجية — المأمورية الجديدة تتسجل "pending" ويُراجعها الأدمن ──
+  // default "approved" عشان الصفوف القديمة وزيارات الفروع تبقى معتمدة تلقائياً
+  approvalStatus: mysqlEnum("approvalStatus", ["pending", "approved", "rejected"]).default("approved"),
+  reviewedAt: timestamp("reviewedAt"),
+  reviewedByUserId: int("reviewedByUserId"),
+
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 }, (table) => [
   // فهرس التاريخ الرئيسي — كل استعلامات السجل والتقارير بتمشي عليه
   index("idx_visits_manager_checkin").on(table.managerId, table.checkInAt),
   // بحث الزيارة المفتوحة (checked_in) لكل مدير
   index("idx_visits_manager_status").on(table.managerId, table.status),
+  // فهرس الترتيب الزمني العام — recentVisits/adminList/stats بترتب وتفلتر بـ checkInAt لوحده
+  index("idx_visits_checkin_at").on(table.checkInAt),
 ]);
 
 export type Visit = typeof visits.$inferSelect;

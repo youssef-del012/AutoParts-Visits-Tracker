@@ -152,9 +152,9 @@ const ONLINE_TOAST_DEBOUNCE_MS = 10_000;
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 export function useGeofence() {
   const { data: branches = [], isSuccess: branchesLoaded } =
-    trpc.manager.getMyBranches.useQuery();
+    trpc.manager.getMyBranches.useQuery(undefined, { staleTime: 5 * 60 * 1000 });
   const { data: historyData, refetch: refetchHistory, isLoading: historyLoading } =
-    trpc.visit.myHistory.useQuery({ limit: 1, offset: 0 });
+    trpc.visit.myHistory.useQuery({ limit: 1, offset: 0 }, { staleTime: 30_000 });
 
   const checkInMutation = trpc.visit.checkIn.useMutation();
 
@@ -442,6 +442,56 @@ export function useGeofence() {
     if (isOnline() && now - lastLocationSyncAtRef.current >= LOCATION_SYNC_INTERVAL_MS) {
       lastLocationSyncAtRef.current = now;
       syncOfflineDataRef.current(); // fire-and-forget — مش بنوقف المنطق عليها
+    }
+
+    // ── ✅ المأمورية الخارجية النشطة: خروج تلقائي لما المدير يخرج من نطاق المأمورية ──
+    // المأمورية القديمة بدون إحداثيات مركز تكمّل مسارها العادي من غير معالجة
+    const missionVisit = activeVisitRef.current;
+    if (missionVisit?.visitType === "external_mission" && missionVisit.missionLatitude && missionVisit.missionLongitude) {
+      const radius = missionVisit.missionRadiusMeters || 200;
+      // مفتاح سالب فريد — ميتصادش مع مفاتيح عدّادات الفروع
+      const missionKey = -missionVisit.id;
+      const dist = getDistanceMeters(
+        currentLat, currentLng,
+        parseFloat(missionVisit.missionLatitude),
+        parseFloat(missionVisit.missionLongitude)
+      );
+      if (dist > radius + 50) {
+        // ✅ نأكد من قراءتين متتاليتين خارج النطاق قبل إنهاء المأمورية
+        const count = (outsideCountRef.current.get(missionKey) ?? 0) + 1;
+        outsideCountRef.current.set(missionKey, count);
+        if (count < REQUIRED_OUTSIDE_READINGS) return;
+
+        outsideCountRef.current.delete(missionKey);
+        if (isOnline()) {
+          try {
+            await checkOutMutationRef.current.mutateAsync({ visitId: missionVisit.id });
+            toast.success(`✅ تم إنهاء المأمورية الخارجية تلقائيًا (خروج من نطاق ${radius}م)`);
+            refetchHistoryRef.current();
+            // ⚡ ابعت نقاط التتبع فوراً مع الحدث
+            syncOfflineDataRef.current();
+          } catch { /* ignore */ }
+        } else {
+          // ✅ بنبعت checkInAt عشان السيرفر يقدر يحسب المدة صح
+          const pending = await getPendingVisits();
+          pending.push({
+            type: "check_out",
+            localCheckInId: `server_${missionVisit.id}`,
+            serverVisitId: missionVisit.id,
+            branchName: "مأمورية خارجية",
+            checkInAt: missionVisit.checkInAt instanceof Date
+              ? missionVisit.checkInAt.toISOString()
+              : String(missionVisit.checkInAt),
+            checkOutAt: new Date().toISOString(),
+          });
+          await setPendingVisits(pending);
+          toast.info(`📦 سجلنا خروج المأمورية أوفلاين وسيُزامن تلقائيًا`);
+        }
+        return;
+      }
+      // داخل نطاق المأمورية → صفّر العداد
+      outsideCountRef.current.delete(missionKey);
+      return;
     }
 
     // ── لو الوضع manual: استمر في تسجيل الإحداثيات (Live Tracking) لكن أوقف التسجيل التلقائي ──

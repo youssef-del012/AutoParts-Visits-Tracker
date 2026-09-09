@@ -1,0 +1,193 @@
+/* ── BranchCheckIn styles — مستخرجة من وسم <style> داخل الصفحة بدون تغيير أي قيمة ── */
+
+.blue-dot-map-page {
+  min-height: 100svh;
+  background-color: #0b1326;
+  color: #ffffff;
+  font-family: 'Cairo', 'Inter', sans-serif;
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  z-index: 0;
+}
+
+.top-bar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 60px;
+  padding: 0 20px;
+  padding-top: env(safe-area-inset-top, 0px);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  z-index: 1000;
+  background: linear-gradient(to bottom, rgba(11,19,38,0.9), transparent);
+}
+.top-bar-title { font-size: 16px; font-weight: 700; }
+
+.icon-btn {
+  width: 40px; height: 40px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: rgba(30,34,40,0.85);
+  border: 1px solid rgba(255,255,255,0.08);
+  color: #fff;
+  cursor: pointer;
+}
+
+.floating-sidebar {
+  position: absolute;
+  left: 16px;
+  top: 40%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 1000;
+}
+.sidebar-btn {
+  width: 44px; height: 44px;
+  border-radius: 12px;
+  background: rgba(30, 34, 40, 0.9);
+  border: 1px solid rgba(255,255,255,0.08);
+  display: flex; align-items: center; justify-content: center;
+  color: #fff;
+  backdrop-filter: blur(8px);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.sidebar-btn:hover { background: rgba(30, 34, 40, 1); }
+.sidebar-btn.active { background: #0fa5f8; }
+
+.gps-chip {
+  position: absolute;
+  top: 70px;
+  right: 16px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: rgba(30,34,40,0.9);
+  border: 1px solid rgba(255,255,255,0.08);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.external-mission-btn {
+  position: absolute;
+  top: 70px;
+  left: 16px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: rgba(139, 92, 246, 0.9);
+  border: 1px solid rgba(255,255,255,0.2);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  color: white;
+  box-shadow: 0 4px 12px rgba(139, 92, 246, 0.3);
+  transition: all 0.2s;
+}
+.external-mission-btn:hover { background: rgba(139, 92, 246, 1); transform: translateY(-1px); }
+.external-mission-btn:active { transform: translateY(1px); }
+
+.bottom-card-container {
+  position: absolute;
+  bottom: 90px;
+  left: 0; right: 0;
+  padding: 0 20px;
+  z-index: 1000;
+}
+
+.check-in-card {
+  background: rgba(30, 34, 40, 0.97);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 24px;
+  padding: 22px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 18px; }
+.branch-info h2 { font-size: 17px; font-weight: 700; margin: 0 0 4px 0; }
+.branch-info p { font-size: 12px; color: rgba(255,255,255,0.5); margin: 0; }
+
+.action-button {
+  width: 100%;
+  height: 52px;
+  border-radius: 14px;
+  font-size: 15px;
+  font-weight: 700;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  border: none;
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+.action-button:active { transform: scale(0.98); }
+.btn-cyan { background: #0fa5f8; color: #fff; }
+.btn-red { background: rgba(239,68,68,0.12); color: #ef4444; border: 1px solid rgba(239,68,68,0.35); }
+
+.confirm-row { display: flex; gap: 10px; }
+.confirm-row .action-button { height: 46px; font-size: 13px; }
+.btn-confirm-no { flex: 1; background: rgba(255,255,255,0.08); color: #fff; }
+.btn-confirm-yes { flex: 2; background: #ef4444; color: #fff; }
+
+/* ── قائمة الفروع ── */
+.branches-scroll {
+  position: absolute;
+  top: 60px; bottom: 200px; left: 0; right: 0;
+  overflow-y: auto;
+  padding: 12px 16px;
+  z-index: 500;
+}
+.branch-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(30,34,40,0.95);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 16px;
+  padding: 14px;
+  margin-bottom: 10px;
+}
+.branch-row-info { flex: 1; min-width: 0; }
+.branch-row-info h4 { font-size: 14px; font-weight: 700; margin: 0 0 3px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.branch-row-info p { font-size: 11px; color: rgba(255,255,255,0.45); margin: 0; }
+.dist-chip {
+  font-size: 11px; font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+.mini-checkin-btn {
+  border: none;
+  background: #0fa5f8;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 8px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mini-checkin-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.map-overlay-gps {
+  position: absolute;
+  inset: 0;
+  z-index: 800;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(11,19,38,0.75);
+  backdrop-filter: blur(4px);
+  text-align: center;
+  padding: 24px;
+}

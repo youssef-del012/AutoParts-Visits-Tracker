@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
-import { Loader2, ChevronDown, ChevronUp, Download, Clock, CheckCircle2 } from "lucide-react";
+import { Loader2, ChevronDown, ChevronUp, Download, Clock, CheckCircle2, MapPin } from "lucide-react";
 import { useSearch } from "wouter";
 import { trpc } from "@/lib/trpc";
 import { format, startOfMonth, endOfMonth, isToday, subMonths, addMonths, setDate } from "date-fns";
@@ -28,6 +28,18 @@ interface Visit {
   managerEmail: string | null;
   distanceToPrevBranchKm: number | null;
   mockReasons: string | null;
+  // ── حقول المأمورية الخارجية (adminList) ──
+  latitudeIn: string | null;
+  longitudeIn: string | null;
+  missionLatitude: string | null;
+  missionLongitude: string | null;
+  missionRadiusMeters: number | null;
+  nearestBranchId: number | null;
+  nearestBranchName: string | null;
+  nearestBranchDistanceKm: string | null;
+  // ── اعتماد المأمورية الخارجية ──
+  approvalStatus: "pending" | "approved" | "rejected";
+  reviewedAt: string | null;
 }
 
 interface DayGroup {
@@ -213,6 +225,17 @@ function DayCard({ group }: { group: DayGroup }) {
     }
   });
 
+  // ── اعتماد/رفض المأمورية الخارجية — ثم تحديث قائمة adminList ──
+  const reviewMutation = trpc.visit.reviewMission.useMutation({
+    onSuccess: (_data, vars) => {
+      toast.success(vars.decision === "approved" ? "تم اعتماد المأمورية" : "تم رفض المأمورية");
+      trpcCtx.visit.adminList.invalidate();
+    },
+    onError: (err) => {
+      toast.error(err.message || "حدث خطأ أثناء مراجعة المأمورية");
+    },
+  });
+
   const todayFlag = isToday(new Date(group.date));
   const dayNum = format(new Date(group.date), "d");
   const dayName = format(new Date(group.date), "EEE", { locale });
@@ -372,6 +395,55 @@ function DayCard({ group }: { group: DayGroup }) {
                             )}
                           </div>
 
+                          {/* ── معلومات المأمورية الخارجية: الموقع + أقرب فرع ── */}
+                          {v.visitType === "external_mission" && (
+                            <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                              {v.latitudeIn && v.longitudeIn && (
+                                <>
+                                  <a href={`https://www.google.com/maps?q=${v.latitudeIn},${v.longitudeIn}`} target="_blank" rel="noopener"
+                                    className="font-mono text-[11px] font-bold px-1.5 py-0.5 rounded-full border flex items-center gap-1 transition-opacity hover:opacity-80"
+                                    style={{ color: "var(--adm-blue)", background: "var(--adm-blue-soft)", borderColor: "var(--adm-blue-soft-border)" }}>
+                                    <MapPin className="w-3 h-3" />
+                                    {t("reports.openLocation")}
+                                  </a>
+                                  <span className="font-mono text-[10px] font-semibold px-1.5 py-0.5 rounded-full border border-[var(--adm-border)] text-[var(--adm-text-2)]">
+                                    {parseFloat(v.latitudeIn).toFixed(5)}, {parseFloat(v.longitudeIn).toFixed(5)}
+                                  </span>
+                                </>
+                              )}
+                              <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full border flex items-center gap-1" style={{ color: "var(--adm-blue)", background: "var(--adm-blue-soft)", borderColor: "var(--adm-blue-soft-border)" }}>
+                                <span className="material-symbols-outlined text-[11px]">near_me</span>
+                                {t("reports.nearestBranch")}: {v.nearestBranchName ?? "—"}{v.nearestBranchName && v.nearestBranchDistanceKm != null ? ` • ${parseFloat(v.nearestBranchDistanceKm).toFixed(1)} ${t("reports.km")}` : ""}
+                              </span>
+                              {/* ── حالة المراجعة + أزرار الموافقة/الرفض ── */}
+                              {v.approvalStatus && (
+                                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full border flex items-center gap-1" title={t("reports.approvalStatus")}
+                                  style={v.approvalStatus === "pending"
+                                    ? { color: "var(--adm-amber)", background: "var(--adm-amber-soft)", borderColor: "var(--adm-amber-soft-border)" }
+                                    : v.approvalStatus === "approved"
+                                      ? { color: "var(--adm-green)", background: "var(--adm-green-soft)", borderColor: "var(--adm-green-soft-border)" }
+                                      : { color: "var(--adm-red)", background: "var(--adm-red-soft)", borderColor: "var(--adm-red-soft-border)" }}>
+                                  <span className="material-symbols-outlined text-[11px]">{v.approvalStatus === "pending" ? "hourglass_top" : v.approvalStatus === "approved" ? "check_circle" : "cancel"}</span>
+                                  {v.approvalStatus === "pending" ? t("reports.pending") : v.approvalStatus === "approved" ? t("reports.approved") : t("reports.rejected")}
+                                </span>
+                              )}
+                              {v.approvalStatus === "pending" && (
+                                <span className="flex items-center gap-1">
+                                  <button onClick={(e) => { e.stopPropagation(); reviewMutation.mutate({ visitId: v.id, decision: "approved" }); }}
+                                    disabled={reviewMutation.isPending}
+                                    className="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded hover:bg-emerald-500/30 transition-colors border border-emerald-500/30 disabled:opacity-40 cursor-pointer">
+                                    {t("reports.approve")}
+                                  </button>
+                                  <button onClick={(e) => { e.stopPropagation(); reviewMutation.mutate({ visitId: v.id, decision: "rejected" }); }}
+                                    disabled={reviewMutation.isPending}
+                                    className="text-xs bg-red-500/20 text-red-400 px-2 py-1 rounded hover:bg-red-500/30 transition-colors border border-red-500/30 disabled:opacity-40 cursor-pointer">
+                                    {t("reports.reject")}
+                                  </button>
+                                </span>
+                              )}
+                            </div>
+                          )}
+
                           {v.isMocked === "yes" && v.mockReasons && (
                             <div className="mt-2 flex flex-wrap gap-1.5">
                               {parseMockReasons(v.mockReasons).map((r, i) => (
@@ -478,6 +550,8 @@ export default function AdminReports() {
   });
   const [exporting, setExporting] = useState(false);
   const [createModalOpen, setCreateModalOpen] = useState(false);
+  // ── فلتر سريع: عرض المأموريات قيد المراجعة فقط ──
+  const [pendingOnly, setPendingOnly] = useState(false);
 
   // ── Deep-link: /reports?managerId=<n> pre-filters the manager dropdown (Part B)
   const searchString = useSearch();
@@ -494,6 +568,7 @@ export default function AdminReports() {
     managerId: filters.managerId ? Number(filters.managerId) : undefined,
     startDate: filters.startDate || undefined,
     endDate: filters.endDate || undefined,
+    approvalStatus: pendingOnly ? ("pending" as const) : undefined,
     limit: 1000,
     offset: 0,
   };
@@ -654,6 +729,18 @@ export default function AdminReports() {
           ))}
         </div>
 
+        {/* فلتر سريع: المأموريات قيد المراجعة — يظهر دائماً فوق قائمة الأيام */}
+        <div className="flex items-center justify-end">
+          <button onClick={() => setPendingOnly(p => !p)}
+            className="text-[11px] font-bold px-3 py-1.5 rounded-full border flex items-center gap-1.5 transition-all cursor-pointer"
+            style={pendingOnly
+              ? { color: "var(--adm-amber)", background: "var(--adm-amber-soft)", borderColor: "var(--adm-amber-soft-border)" }
+              : { color: "var(--adm-text-2)", background: "transparent", borderColor: "var(--adm-border)" }}>
+            <span className="material-symbols-outlined text-[14px]">hourglass_top</span>
+            {t("reports.pendingFilter")}
+          </button>
+        </div>
+
         {/* Day Groups */}
         {isLoading ? (
           <div className="flex justify-center items-center py-24">
@@ -678,7 +765,7 @@ export default function AdminReports() {
               </span>
             </div>
             {dayGroups.map((group, i) => (
-              <DayCard key={`${group.managerId}-${group.date}`} group={group} />
+              <DayCard key={`${group.managerEmail ?? group.managerName}-${group.date}`} group={group} />
             ))}
           </section>
         )}

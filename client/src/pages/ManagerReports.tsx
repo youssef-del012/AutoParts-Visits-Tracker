@@ -1,4 +1,4 @@
-﻿import { useState, useMemo } from "react";
+import { useState, useMemo } from "react";
 import { trpc } from "@/lib/trpc";
 import { format, subMonths, addMonths, setDate } from "date-fns";
 import { ar } from "date-fns/locale";
@@ -81,7 +81,10 @@ export default function ManagerReports() {
   const total = data?.total ?? 0;
 
   const totalMin = visits.filter(v=>v.checkOutAt).reduce((acc,v)=>acc+durationMin(v.checkInAt,v.checkOutAt),0);
-  const totalDistanceKm = visits.reduce((acc,v)=>acc+(v.distanceToPrevBranchKm!=null?parseFloat(v.distanceToPrevBranchKm):0),0);
+  const totalDistanceKm = visits.reduce(
+    (acc, v) => acc + (v.distanceToPrevBranchKm != null ? parseFloat(v.distanceToPrevBranchKm) : 0),
+    0
+  );
 
   const dayMap = new Map<string, any[]>();
   visits.forEach(v => {
@@ -228,7 +231,7 @@ export default function ManagerReports() {
                         {format(ci,"hh:mm a")}
                         {co && ` ← ${format(co,"hh:mm a")}`}
                         {dur>0 && ` • ${fmtDuration(dur)}`}
-                        {v.distanceToPrevBranchKm && ` • ${parseFloat(v.distanceToPrevBranchKm).toFixed(1)} كم`}
+                        {v.distanceToPrevBranchKm != null && ` • ${parseFloat(v.distanceToPrevBranchKm).toFixed(1)} كم`}
                       </p>
                       {v.noteType==="short_visit" && <span className="vtag" style={{background:"rgba(245,158,11,0.12)",color:"#f59e0b"}}>زيارة قصيرة</span>}
                       {v.visitType==="external_mission" && <span className="vtag" style={{background:"rgba(139,92,246,0.12)",color:"#8b5cf6",marginRight:4}}>مأمورية</span>}

@@ -1,12 +1,13 @@
 import { z } from "zod";
-import { eq, and, gte, lte, desc, count, lt } from "drizzle-orm";
+import { eq, and, or, ne, gte, lte, desc, count, sql } from "drizzle-orm";
 import { router, protectedProcedure, adminProcedure, superAdminProcedure } from "./_core/trpc";
 import { getDb } from "./db";
 import { visits, managers, branches, users, locationLogs } from "../drizzle/schema";
 import { storagePut } from "./storage";
 import { getDistanceMeters } from "../shared/utils";
-import { getBranchDistance } from "../shared/gizaBranchDistances";
-import { notifyOwner } from "./_core/notification";
+import { checkTravelFromPrevBranch, type Db } from "./visits/distance";
+import { finalizeCheckOut } from "./visits/checkout";
+import { getManagerName, notifyMockedCheckIn, notifyMockedCheckInOffline, notifyShortVisit, notifyTeleportation, notifyExternalMissionPending } from "./visits/notifications";
 
 // ── In-Memory Lock لمنع الدخول المتزامن (Race Condition) ─────────────────────
 const activeCheckInLocks = new Set<number>();
@@ -14,185 +15,19 @@ const activeCheckInLocks = new Set<number>();
 // ── Schemas مشتركة ────────────────────────────────────────────────────────────
 const coordSchema = z.string().regex(/^-?\d{1,3}(\.\d+)?$/, "invalid coordinate");
 
-type Db = NonNullable<Awaited<ReturnType<typeof getDb>>>;
-type ManagerRow = typeof managers.$inferSelect;
 type BranchRow = typeof branches.$inferSelect;
 
-interface VisitForCheckout {
-  id: number;
-  checkInAt: Date;
-  notes?: string | null;
-  branchName: string | null; // جاي إنه null للمأموريات الخارجية (leftJoin)
-  branchLatitude?: string | null;
-  branchLongitude?: string | null;
-}
-
-// ── دالة مساعدة: احسب المسافة من الفرع السابق (أي زيارة مكتملة في نفس اليوم) ─
-// ✅ استراتيجية مزدوجة:
-//    ① مصفوفة المسافات المعتمدة من الشيت (أدق — مسافات طرق فعلية)
-//    ② Fallback Haversine بين إحداثيات الفرعين (خط مستقيم — تقريب كافٍ
-//       لكشف الغش) مع تاج DIST_HAVERSINE_ESTIMATE عشان الأدمن يعرف المصدر
-async function calcDistanceFromPrevBranch(
-  db: Db,
-  managerId: number,
-  currentBranchName: string,
-  currentLat: number | undefined,
-  currentLng: number | undefined,
-  referenceTime: Date,
-): Promise<{ km: number; prevBranchName: string; timeDiffMin: number; estimated: boolean } | null> {
-  const dayStart = new Date(referenceTime);
-  dayStart.setHours(0, 0, 0, 0);
-
-  // جيب آخر زيارة مكتملة في نفس اليوم (أي مدة — مش شرط 15 دقيقة)
-  const prevVisits = await db.select({
-    branchName: branches.name,
-    latitude: branches.latitude,
-    longitude: branches.longitude,
-    checkInAt:  visits.checkInAt,
-    checkOutAt: visits.checkOutAt,
-  }).from(visits)
-    .innerJoin(branches, eq(visits.branchId, branches.id))
-    .where(and(
-      eq(visits.managerId, managerId),
-      eq(visits.status, "checked_out"),
-      gte(visits.checkInAt, dayStart),
-      lt(visits.checkInAt, referenceTime), // قبل الزيارة الحالية فقط
-    ))
-    .orderBy(desc(visits.checkInAt))
-    .limit(1);
-
-  if (!prevVisits[0]?.checkOutAt) return null;
-
-  const prev = prevVisits[0];
-
-  // ① الأولوية للمصفوفة المعتمدة
-  let km = getBranchDistance(prev.branchName, currentBranchName);
-  let estimated = false;
-
-  // ② Fallback: خط مستقيم بين الإحداثيات
-  if (km === null && currentLat !== undefined && currentLng !== undefined
-      && prev.latitude && prev.longitude) {
-    const meters = getDistanceMeters(
-      parseFloat(prev.latitude), parseFloat(prev.longitude),
-      currentLat, currentLng
-    );
-    km = Math.round(meters / 100) / 10; // تقريب لأقرب 100 متر
-    estimated = true;
-  }
-
-  if (km === null) {
-    console.warn(`[Distances] No distance source for: "${prev.branchName}" → "${currentBranchName}"`);
-    return null;
-  }
-
-  const timeDiffMin = (referenceTime.getTime() - (prev.checkOutAt as Date).getTime()) / 60_000;
-
-  return { km, prevBranchName: prev.branchName, timeDiffMin, estimated };
-}
-
-// ── دالة مساعدة: هل الانتقال مستحيل؟ (Teleportation check) ─────────────────
-function isTeleportation(km: number, timeDiffMin: number): boolean {
-  if (timeDiffMin <= 0) return true; // مستحيل فيزيائياً
-  const speedKmh = km / (timeDiffMin / 60);
-  // أكثر من 80 كم/ساعة في وسط القاهرة والجيزة → مستحيل
-  return speedKmh > 80;
-}
-
-// ── 🎯 الدالة الموحدة لإغلاق زيارة (كانت منسوخة 3 مرات — دلوقتي مرة واحدة) ──
-// بتستخدمها: checkOut + nativeCheckOut + syncOfflineVisits
-async function finalizeCheckOut(
-  db: Db,
-  managerId: number,
-  visit: VisitForCheckout,
-  checkOutTime: Date,
-): Promise<{ durationMin: number; distanceKm: number | null; isTeleporting: boolean; distanceEstimated: boolean }> {
-  const durationMin = (checkOutTime.getTime() - visit.checkInAt.getTime()) / 60_000;
-
-  // المسافة والـ Teleportation بيتحسبوا دايماً بغض النظر عن المدة
-  let distanceKm: number | undefined;
-  let isTeleporting = false;
-  let distanceEstimated = false;
-
-  // ✅ لا نحسب مسافة للمأموريات الخارجية (branchName = null يعني مفيش فرع)
-  if (visit.branchName) {
-    const prevResult = await calcDistanceFromPrevBranch(
-      db,
-      managerId,
-      visit.branchName,
-      visit.branchLatitude ? parseFloat(visit.branchLatitude) : undefined,
-      visit.branchLongitude ? parseFloat(visit.branchLongitude) : undefined,
-      visit.checkInAt
-    );
-    if (prevResult !== null) {
-      distanceKm = prevResult.km;
-      distanceEstimated = prevResult.estimated;
-      // إعادة فحص Teleportation كـ double-check (الأساسي بيحصل وقت checkIn)
-      if (isTeleportation(prevResult.km, prevResult.timeDiffMin)) {
-        isTeleporting = true;
-      }
-    }
-  }
-
-  // نجيب الـ suspicionScore الحالي من الداتابيز عشان نجمع عليه
-  const currentVisitData = await db.select({
-    suspicionScore: visits.suspicionScore,
-    mockReasons: visits.mockReasons,
-  }).from(visits).where(eq(visits.id, visit.id)).limit(1);
-
-  const existingScore   = currentVisitData[0]?.suspicionScore ?? 0;
-  const existingReasons: string[] = (() => {
-    try { return JSON.parse(currentVisitData[0]?.mockReasons ?? "[]"); } catch { return []; }
-  })();
-
-  // ✅ بناء الأسباب الجديدة: تاج مصدر المسافة + الزيارة القصيرة
-  const newReasons = [...existingReasons];
-  if (distanceEstimated) newReasons.push("DIST_HAVERSINE_ESTIMATE");
-  let shortVisitScore = 0;
-  if (durationMin < 3) {
-    shortVisitScore = 80;
-    newReasons.push(`SHORT_VISIT:${Math.round(durationMin * 60)}sec`);
-  } else if (durationMin < 7) {
-    shortVisitScore = 40;
-    newReasons.push(`SHORT_VISIT:${Math.round(durationMin)}min`);
-  }
-
-  const finalScore = existingScore + shortVisitScore; // teleport score اتحسب وقت checkIn
-  // ✅ مقارنة بالمحتوى مش بالطول — عشان أي تغيير في الأسباب يتسجل
-  const reasonsChanged = JSON.stringify(newReasons) !== JSON.stringify(existingReasons);
-  const isShortMocked = shortVisitScore >= 80; // أقل من 3 دقايق → وهمي مباشرة
-
-  // لا نكتب "no" أبداً — فقط "yes" إذا اكتشفنا teleporting أو زيارة قصيرة جداً
-  const mockedUpdate = (isTeleporting || isShortMocked)
-    ? { isMocked: "yes" as const }
-    : {};
-
-  await db.update(visits).set({
-    checkOutAt: checkOutTime,
-    status: "checked_out",
-    ...mockedUpdate,
-    ...(distanceKm !== undefined ? { distanceToPrevBranchKm: distanceKm.toString() } : {}),
-    ...(reasonsChanged ? {
-      suspicionScore: finalScore,
-      mockReasons: JSON.stringify(newReasons),
-    } : {}),
-  }).where(and(
-    eq(visits.id, visit.id),
-    eq(visits.managerId, managerId),
-    eq(visits.status, "checked_in"), // ✅ حارس: ميتكتبش على زيارة متقفلة خلاص (idempotency)
-  ));
-
-  return {
-    durationMin,
-    distanceKm: distanceKm ?? null,
-    isTeleporting,
-    distanceEstimated,
-  };
-}
-
-async function getManagerName(db: Db, userId: number): Promise<string> {
-  const rows = await db.select({ name: users.name }).from(users).where(eq(users.id, userId)).limit(1);
-  return rows[0]?.name ?? "مدير غير معروف";
-}
+// ── الحقول المشتركة بين myHistory و getActive (نفس شكل عنصر myHistory) ──────
+const visitHistorySelection = {
+  id: visits.id, checkInAt: visits.checkInAt, checkOutAt: visits.checkOutAt,
+  status: visits.status, photoUrl: visits.photoUrl, notes: visits.notes,
+  latitudeIn: visits.latitudeIn, longitudeIn: visits.longitudeIn,
+  distanceToPrevBranchKm: visits.distanceToPrevBranchKm,
+  isMocked: visits.isMocked,
+  visitType: visits.visitType, noteType: visits.noteType,
+  missionLatitude: visits.missionLatitude, missionLongitude: visits.missionLongitude, missionRadiusMeters: visits.missionRadiusMeters,
+  branchName: branches.name, branchId: branches.id, branchCode: branches.code, branchAddress: branches.address,
+};
 
 export const visitRouter = router({
   // POST — manager checks in to a branch or external mission
@@ -204,6 +39,10 @@ export const visitRouter = router({
       latitude: coordSchema,
       longitude: coordSchema,
       accuracy: z.string().max(32).optional(),
+      // ── نطاق المأمورية الخارجية التلقائي (اختياري) ─────────────────────────
+      missionLatitude: coordSchema.optional(),
+      missionLongitude: coordSchema.optional(),
+      missionRadiusMeters: z.number().int().min(20).max(10000).optional(),
       photoBase64: z.string().max(6_000_000).optional(),
       notes: z.string().max(1000).optional(),
       isMocked: z.boolean().optional(),
@@ -216,9 +55,14 @@ export const visitRouter = router({
       const db = await getDb();
       if (!db) throw new Error("Database not available");
 
-      const managerResult = await db.select().from(managers).where(eq(managers.userId, ctx.user!.id)).limit(1);
-      if (!managerResult[0]) throw new Error("Manager profile not found");
-      const manager = managerResult[0];
+      // ✅ استعلام واحد بدل اثنين: المدير + وضع التسجيل checkinMode (join managers↔users)
+      const managerRows = await db.select({ manager: managers, checkinMode: users.checkinMode })
+        .from(managers)
+        .innerJoin(users, eq(managers.userId, users.id))
+        .where(eq(managers.userId, ctx.user!.id))
+        .limit(1);
+      if (!managerRows[0]) throw new Error("Manager profile not found");
+      const manager = managerRows[0].manager;
 
       if (activeCheckInLocks.has(manager.id)) {
         throw new Error("Already processing a check-in request, please wait.");
@@ -232,16 +76,14 @@ export const visitRouter = router({
 
       // \u2705 Manual mode enforcement: the user's app-level auto engine is expected to be off,
       // but any client could still call this endpoint without geofence/sensor context.
-      const meRow = await db.select({ checkinMode: users.checkinMode }).from(users)
-          .where(eq(users.id, ctx.user!.id)).limit(1);
         // manual-mode users may check in ONLY via the explicit manual button flag;
         // any auto-engine path (native or web) is rejected.
-        if (meRow[0]?.checkinMode === "manual" && input.visitType === "branch" && !input.manual) {
+        if (managerRows[0].checkinMode === "manual" && input.visitType === "branch" && !input.manual) {
           throw new Error("MANUAL_MODE_BLOCKED");
         }
 
       let branch: BranchRow | undefined;
-      
+
       if (input.visitType === "branch" || input.branchId) {
         if (!input.branchId) throw new Error("Branch ID is required for a branch visit.");
         const branchResult = await db.select().from(branches).where(eq(branches.id, input.branchId)).limit(1);
@@ -268,20 +110,51 @@ export const visitRouter = router({
       const teleportReasons: string[] = [];
 
       if (branch) {
-        const prevResult = await calcDistanceFromPrevBranch(
+        // ✅ الفحص الموحد (كانت منسوخة هنا + في syncOfflineVisits + في finalizeCheckOut)
+        const travel = await checkTravelFromPrevBranch(
           db, manager.id, branch.name,
           parseFloat(branch.latitude), parseFloat(branch.longitude),
           new Date()
         );
-        if (prevResult !== null) {
-          const { km, prevBranchName, timeDiffMin } = prevResult;
-          if (isTeleportation(km, timeDiffMin)) {
-            isTeleporting = true;
-            const speedKmh = Math.round(km / (timeDiffMin / 60));
-            teleportReasons.push(
-              `TELEPORTATION:${prevBranchName}→${branch.name}:${km.toFixed(1)}km:${Math.round(timeDiffMin)}min:${speedKmh}kmh`
-            );
-          }
+        if (travel.isTeleporting) {
+          isTeleporting = true;
+          teleportReasons.push(travel.teleportReason!);
+        }
+      } else if (input.visitType === "external_mission") {
+        // 🚨 فحص Teleportation للمأمورية الخارجية — الاسم غير موجود في جدول المسافات
+        // فيعمل Fallback Haversine بالإحداثيات (نفس الفحص الموحد ونفس فورمات السبب)
+        const travel = await checkTravelFromPrevBranch(
+          db, manager.id, "مأمورية خارجية",
+          parseFloat(input.latitude), parseFloat(input.longitude),
+          new Date()
+        );
+        if (travel.isTeleporting) {
+          isTeleporting = true;
+          teleportReasons.push(travel.teleportReason!);
+        }
+      }
+
+      // ── 📍 أقرب فرع للمأمورية الخارجية (يُخزن للعرض في تقارير الأدمن) ─────────
+      let nearestBranchId: number | undefined;
+      let nearestBranchName: string | undefined;
+      let nearestBranchDistanceKm: string | undefined;
+      if (input.visitType === "external_mission") {
+        const activeBranches = await db.select({
+          id: branches.id, name: branches.name,
+          latitude: branches.latitude, longitude: branches.longitude,
+        }).from(branches).where(eq(branches.isActive, "yes"));
+        const missionLat = parseFloat(input.latitude);
+        const missionLng = parseFloat(input.longitude);
+        let best: { id: number; name: string; km: number } | null = null;
+        for (const b of activeBranches) {
+          const meters = getDistanceMeters(missionLat, missionLng, parseFloat(b.latitude), parseFloat(b.longitude));
+          const km = meters / 1000;
+          if (!best || km < best.km) best = { id: b.id, name: b.name, km };
+        }
+        if (best) {
+          nearestBranchId = best.id;
+          nearestBranchName = best.name;
+          nearestBranchDistanceKm = best.km.toFixed(2);
         }
       }
 
@@ -303,17 +176,34 @@ export const visitRouter = router({
         isMocked: finalIsMocked ? "yes" : "no",
         suspicionScore: finalScore,
         mockReasons: finalReasons,
-        distanceToPrevBranchKm: undefined,  // هيتحدث وقت الـ checkout
+        // ── مركز المأمورية للجيوفنس التلقائي — يُخزن للمأمورية الخارجية فقط ──
+        ...(input.visitType === "external_mission" ? {
+          missionLatitude: input.missionLatitude ?? input.latitude,
+          missionLongitude: input.missionLongitude ?? input.longitude,
+          missionRadiusMeters: input.missionRadiusMeters ?? 200,
+          // المأمورية الخارجية تتسجل بانتظار المراجعة — الفروع تبقى approved من الـ default
+          approvalStatus: "pending" as const,
+          // أقرب فرع للإحداثيات — لو مفيش فروع نشطة يتسيبوا undefined (NULL)
+          ...(nearestBranchId !== undefined ? {
+            nearestBranchId, nearestBranchName, nearestBranchDistanceKm,
+          } : {}),
+        } : {}),
       });
+
+      // 🧭 لو مأمورية خارجية — إشعار كامل للأدمن بانتظار المراجعة (fire-and-forget)
+      if (input.visitType === "external_mission") {
+        const managerName = await getManagerName(db, ctx.user!.id);
+        notifyExternalMissionPending(
+          managerName, input.notes,
+          parseFloat(input.latitude), parseFloat(input.longitude), input.accuracy,
+          nearestBranchName, nearestBranchDistanceKm, new Date()
+        );
+      }
 
       // 🚨 لو الزيارة وهمية — ابعت إشعار فوري للأدمن
       if (finalIsMocked) {
         const managerName = await getManagerName(db, ctx.user!.id);
-        const locationName = branch ? branch.name : "مأمورية خارجية";
-        notifyOwner({
-          title: "🚨 زيارة وهمية مكتشفة",
-          content: `المدير: ${managerName}\nالمكان: ${locationName}\nالوقت: ${new Date().toLocaleString("ar-EG")}\n${isTeleporting ? "تم اكتشاف انتقال غير منطقي (Teleportation)" : "تحديد موقع وهمي"}`,
-        }).catch(() => {}); // لا نوقف الـ check-in لو فشل الإشعار
+        notifyMockedCheckIn(managerName, branch ? branch.name : "مأمورية خارجية", isTeleporting);
       }
 
       return { success: true };
@@ -330,16 +220,19 @@ export const visitRouter = router({
       const db = await getDb();
       if (!db) throw new Error("Database not available");
 
-      const managerResult = await db.select().from(managers).where(eq(managers.userId, ctx.user!.id)).limit(1);
-      if (!managerResult[0]) throw new Error("Manager profile not found");
-      const manager = managerResult[0];
+      // ✅ استعلام واحد بدل اثنين: المدير + checkinMode (نفس نمط checkIn)
+      const managerRows = await db.select({ manager: managers, checkinMode: users.checkinMode })
+        .from(managers)
+        .innerJoin(users, eq(managers.userId, users.id))
+        .where(eq(managers.userId, ctx.user!.id))
+        .limit(1);
+      if (!managerRows[0]) throw new Error("Manager profile not found");
+      const manager = managerRows[0].manager;
 
       // \u2705 Manual mode: native auto check-out is disabled
-      const coModeRow = await db.select({ checkinMode: users.checkinMode }).from(users)
-          .where(eq(users.id, ctx.user!.id)).limit(1);
-        if (coModeRow[0]?.checkinMode === "manual") {
-          throw new Error("MANUAL_MODE_BLOCKED");
-        }
+      if (managerRows[0].checkinMode === "manual") {
+        throw new Error("MANUAL_MODE_BLOCKED");
+      }
 
       // Find the active check-in for this specific branch
       const activeVisit = await db.select({
@@ -348,6 +241,9 @@ export const visitRouter = router({
         branchName: branches.name,
         branchLatitude: branches.latitude,
         branchLongitude: branches.longitude,
+        // ✅ جايين مع الـ select الأصلي — finalizeCheckOut مش محتاجة استعلام إضافي
+        suspicionScore: visits.suspicionScore,
+        mockReasons: visits.mockReasons,
       }).from(visits)
         .innerJoin(branches, eq(visits.branchId, branches.id))
         .where(and(
@@ -374,7 +270,7 @@ export const visitRouter = router({
 
   // POST — manager checks out
   checkOut: protectedProcedure
-    .input(z.object({ 
+    .input(z.object({
       visitId: z.number().int().positive(),
       notes: z.string().max(1000).optional(),
       noteType: z.enum(["general", "short_visit", "non_primary", "external_mission"]).optional()
@@ -395,6 +291,9 @@ export const visitRouter = router({
         branchName: branches.name,
         branchLatitude: branches.latitude,
         branchLongitude: branches.longitude,
+        // ✅ جايين مع الـ select الأصلي — finalizeCheckOut مش محتاجة استعلام إضافي
+        suspicionScore: visits.suspicionScore,
+        mockReasons: visits.mockReasons,
       }).from(visits)
         .leftJoin(branches, eq(visits.branchId, branches.id))
         .where(and(
@@ -405,7 +304,6 @@ export const visitRouter = router({
         .limit(1);
 
       if (!visitResult[0]) throw new Error("Visit not found or already checked out.");
-
       const now = new Date();
       const visit = visitResult[0];
       const result = await finalizeCheckOut(db, manager.id, visit, now);
@@ -421,19 +319,13 @@ export const visitRouter = router({
       // 🚨 إشعار للأدمن — teleporting أو زيارة قصيرة جداً
       if (result.isTeleporting) {
         const managerName = await getManagerName(db, ctx.user!.id);
-        notifyOwner({
-          title: "🚨 انتقال وهمي مكتشف (Teleportation)",
-          content: `المدير: ${managerName}\nالفرع: ${visit.branchName}\nالمسافة: ${result.distanceKm?.toFixed(1) ?? "?"} كم\nالوقت: ${now.toLocaleString("ar-EG")}`,
-        }).catch(() => {});
+        notifyTeleportation(managerName, visit.branchName, result.distanceKm, now);
       }
 
       const isShortMocked = result.durationMin < 3;
       if (isShortMocked) {
         const managerName = await getManagerName(db, ctx.user!.id);
-        notifyOwner({
-          title: "🚨 زيارة قصيرة مشبوهة",
-          content: `المدير: ${managerName}\nالفرع: ${visit.branchName}\nمدة الزيارة: ${Math.round(result.durationMin * 60)} ثانية فقط\nالوقت: ${now.toLocaleString("ar-EG")}`,
-        }).catch(() => {});
+        notifyShortVisit(managerName, visit.branchName, result.durationMin, now);
       }
 
       return {
@@ -453,22 +345,44 @@ export const visitRouter = router({
       const db = await getDb();
       if (!db) throw new Error("Database not available");
       const managerResult = await db.select().from(managers).where(eq(managers.userId, ctx.user!.id)).limit(1);
-      if (!managerResult[0]) return { items: [], total: 0 };
+      if (!managerResult[0]) return { items: [], total: 0, activeCount: 0, doneCount: 0 };
       const managerId = managerResult[0].id;
-      const whereClause = eq(visits.managerId, managerId);
-      const [{ total }] = await db.select({ total: count() }).from(visits).where(whereClause);
-      const items = await db.select({
-        id: visits.id, checkInAt: visits.checkInAt, checkOutAt: visits.checkOutAt,
-        status: visits.status, photoUrl: visits.photoUrl, notes: visits.notes,
-        latitudeIn: visits.latitudeIn, longitudeIn: visits.longitudeIn,
-        distanceToPrevBranchKm: visits.distanceToPrevBranchKm,
-        isMocked: visits.isMocked,
-        visitType: visits.visitType, noteType: visits.noteType,
-        branchName: branches.name, branchId: branches.id, branchCode: branches.code, branchAddress: branches.address,
-      }).from(visits).leftJoin(branches, eq(visits.branchId, branches.id))
+      // إخفاء المأموريات المرفوضة من المدير — على القوائم والعدادات (total/activeCount/doneCount)
+      const whereClause = and(
+        eq(visits.managerId, managerId),
+        or(ne(visits.visitType, "external_mission"), ne(visits.approvalStatus, "rejected")),
+      );
+      // ✅ استعلام عدّ واحد بدل استعلام total منفصل: total + activeCount + doneCount
+      const [{ total, activeCount, doneCount }] = await db.select({
+        total: count(),
+        activeCount: sql<number>`count(case when ${visits.status} = 'checked_in' then 1 end)`.mapWith(Number),
+        doneCount: sql<number>`count(case when ${visits.status} = 'checked_out' then 1 end)`.mapWith(Number),
+      }).from(visits).where(whereClause);
+      const items = await db.select(visitHistorySelection)
+        .from(visits).leftJoin(branches, eq(visits.branchId, branches.id))
         .where(whereClause).orderBy(desc(visits.checkInAt)).limit(input.limit).offset(input.offset);
-      return { items, total };
+      return { items, total, activeCount, doneCount };
     }),
+
+  // GET — الزيارة النشطة الحالية للمدير (بنفس شكل عنصر myHistory) أو null
+  // خفيفة: idx_visits_manager_status + limit 1 — بديل أخف لـ myHistory{limit:5} في شاشة تسجيل الدخول
+  getActive: protectedProcedure.query(async ({ ctx }) => {
+    const db = await getDb();
+    if (!db) throw new Error("Database not available");
+    const managerResult = await db.select({ id: managers.id }).from(managers).where(eq(managers.userId, ctx.user!.id)).limit(1);
+    if (!managerResult[0]) return null;
+    const items = await db.select(visitHistorySelection)
+      .from(visits).leftJoin(branches, eq(visits.branchId, branches.id))
+      .where(and(
+        eq(visits.managerId, managerResult[0].id),
+        eq(visits.status, "checked_in"),
+        // المأمورية المرفوضة لا تظهر كزيارة نشطة للمدير
+        or(ne(visits.visitType, "external_mission"), ne(visits.approvalStatus, "rejected")),
+      ))
+      .orderBy(desc(visits.checkInAt))
+      .limit(1);
+    return items[0] ?? null;
+  }),
 
   // GET — admin: all visits with filters
   adminList: adminProcedure
@@ -477,6 +391,7 @@ export const visitRouter = router({
       branchId: z.number().int().positive().optional(),
       startDate: z.string().max(32).optional(),
       endDate: z.string().max(32).optional(),
+      approvalStatus: z.enum(["pending", "approved", "rejected"]).optional(),
       limit: z.number().int().min(1).max(1000).default(100),
       offset: z.number().int().min(0).default(0),
     }))
@@ -492,6 +407,7 @@ export const visitRouter = router({
         end.setHours(23, 59, 59, 999);
         conditions.push(lte(visits.checkInAt, end));
       }
+      if (input.approvalStatus) conditions.push(eq(visits.approvalStatus, input.approvalStatus));
       const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
       const [{ total }] = await db.select({ total: count() }).from(visits)
         .innerJoin(managers, eq(visits.managerId, managers.id))
@@ -504,6 +420,13 @@ export const visitRouter = router({
         // ✅ أسباب التلاعب — تظهر فقط للأدمن في التقارير
         mockReasons: visits.mockReasons,
         visitType: visits.visitType, noteType: visits.noteType,
+        // ── حقول المأمورية الخارجية — إضافة للعرض في تقارير الأدمن ─────────────
+        latitudeIn: visits.latitudeIn, longitudeIn: visits.longitudeIn,
+        missionLatitude: visits.missionLatitude, missionLongitude: visits.missionLongitude, missionRadiusMeters: visits.missionRadiusMeters,
+        nearestBranchId: visits.nearestBranchId, nearestBranchName: visits.nearestBranchName, nearestBranchDistanceKm: visits.nearestBranchDistanceKm,
+        // ── حالة اعتماد المأمورية — للـ badge وأزرار الموافقة/الرفض في تقارير الأدمن ──
+        approvalStatus: visits.approvalStatus,
+        reviewedAt: visits.reviewedAt,
         branchName: branches.name, branchId: branches.id, branchCode: branches.code,
         managerName: users.name, managerEmail: users.email,
         managerPhotoUrl: managers.photoUrl,
@@ -512,6 +435,29 @@ export const visitRouter = router({
         .innerJoin(users, eq(managers.userId, users.id))
         .where(whereClause).orderBy(desc(visits.checkInAt)).limit(input.limit).offset(input.offset);
       return { items, total };
+    }),
+
+  // POST — admin: اعتماد أو رفض مأمورية خارجية (الرفض يغلق الزيارة النشطة لو كانت شغالة)
+  reviewMission: adminProcedure
+    .input(z.object({
+      visitId: z.number().int().positive(),
+      decision: z.enum(["approved", "rejected"]),
+    }))
+    .mutation(async ({ ctx, input }) => {
+      const db = await getDb();
+      if (!db) throw new Error("Database not available");
+      await db.update(visits).set({
+        approvalStatus: input.decision,
+        reviewedAt: new Date(),
+        reviewedByUserId: ctx.user!.id,
+      }).where(and(eq(visits.id, input.visitId), eq(visits.visitType, "external_mission")));
+      if (input.decision === "rejected") {
+        await db.update(visits).set({
+          checkOutAt: new Date(),
+          status: "checked_out",
+        }).where(and(eq(visits.id, input.visitId), eq(visits.status, "checked_in")));
+      }
+      return { success: true };
     }),
 
   // GET — admin dashboard stats
@@ -532,15 +478,15 @@ export const visitRouter = router({
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const [{ todayVisits }] = await db
-      .select({ todayVisits: count() })
+    // ✅ استعلام واحد بدل اثنين: زيارات النهاردة + الوهمية منها (conditional count)
+    // (totalBranches/totalManagers على جدولين مختلفين — دمجهم cross-join هيضرب العدّادات)
+    const [{ todayVisits, mockedVisitsToday }] = await db
+      .select({
+        todayVisits: count(),
+        mockedVisitsToday: sql<number>`count(case when ${visits.isMocked} = 'yes' then 1 end)`.mapWith(Number),
+      })
       .from(visits)
       .where(gte(visits.checkInAt, today));
-
-    const [{ mockedVisitsToday }] = await db
-      .select({ mockedVisitsToday: count() })
-      .from(visits)
-      .where(and(gte(visits.checkInAt, today), eq(visits.isMocked, "yes")));
 
     return { totalBranches, totalManagers, todayVisits, mockedVisitsToday };
   }),
@@ -620,117 +566,119 @@ export const visitRouter = router({
       if (!managerResult[0]) throw new Error("Manager profile not found");
       const manager = managerResult[0];
 
-      let synced = 0;
-      let rejected = 0;
-      const failedLocalIds: string[] = [];
-      const localToServerId = new Map<string, number>();
+      // ✅ المعالجة كلها جوه transaction واحدة (drizzle mysql2) — بدل استعلامات متفرقة
+      return db.transaction(async (tx: Db) => {
+        let synced = 0;
+        let rejected = 0;
+        const failedLocalIds: string[] = [];
+        const localToServerId = new Map<string, number>();
 
-      // ── 1. check-ins ──────────────────────────────────────────────────────
-      const checkIns = input.visits.filter((v) => v.type === "check_in");
-      for (const ci of checkIns) {
-        try {
-          const existing = await db.select({ id: visits.id }).from(visits)
-            .where(and(eq(visits.managerId, manager.id), eq(visits.status, "checked_in")))
-            .limit(1);
-          if (existing.length > 0) { failedLocalIds.push(ci.localId); rejected++; continue; }
+        // ── 1. check-ins ──────────────────────────────────────────────────────
+        const checkIns = input.visits.filter((v) => v.type === "check_in");
+        for (const ci of checkIns) {
+          try {
+            const existing = await tx.select({ id: visits.id }).from(visits)
+              .where(and(eq(visits.managerId, manager.id), eq(visits.status, "checked_in")))
+              .limit(1);
+            if (existing.length > 0) { failedLocalIds.push(ci.localId); rejected++; continue; }
 
-          const branchResult = await db.select().from(branches)
-            .where(eq(branches.id, ci.branchId)).limit(1);
-          if (!branchResult[0]) { failedLocalIds.push(ci.localId); rejected++; continue; }
-          const branch = branchResult[0];
+            const branchResult = await tx.select().from(branches)
+              .where(eq(branches.id, ci.branchId)).limit(1);
+            if (!branchResult[0]) { failedLocalIds.push(ci.localId); rejected++; continue; }
+            const branch = branchResult[0];
 
-          const dist = getDistanceMeters(
-            parseFloat(ci.latitude), parseFloat(ci.longitude),
-            parseFloat(branch.latitude), parseFloat(branch.longitude)
-          );
-          if (dist > (branch.geofenceRadiusMeters || 200) + 50) {
-            console.warn(`[syncOfflineVisits] Rejected: manager ${manager.id} was ${Math.round(dist)}m from branch ${branch.name}`);
+            const dist = getDistanceMeters(
+              parseFloat(ci.latitude), parseFloat(ci.longitude),
+              parseFloat(branch.latitude), parseFloat(branch.longitude)
+            );
+            if (dist > (branch.geofenceRadiusMeters || 200) + 50) {
+              console.warn(`[syncOfflineVisits] Rejected: manager ${manager.id} was ${Math.round(dist)}m from branch ${branch.name}`);
+              failedLocalIds.push(ci.localId);
+              rejected++;
+              continue;
+            }
+
+            // ✅ check-in offline: فحص Teleportation + mock detection (الفحص الموحد)
+            const ciReasons: string[] = [];
+
+            let isTeleporting = false;
+            const checkInTime = new Date(ci.checkInAt);
+            const travel = await checkTravelFromPrevBranch(
+              tx, manager.id, ci.branchName,
+              parseFloat(branch.latitude), parseFloat(branch.longitude),
+              checkInTime
+            );
+            if (travel.isTeleporting) {
+              isTeleporting = true;
+              ciReasons.push(travel.teleportReason!);
+            }
+
+            const ciFinalMocked = ci.isMocked || isTeleporting;
+
+            await tx.update(managers).set({ isActive: "yes" }).where(eq(managers.id, manager.id));
+
+            const inserted = await tx.insert(visits).values({
+              managerId: manager.id,
+              branchId: ci.branchId,
+              latitudeIn: ci.latitude,
+              longitudeIn: ci.longitude,
+              accuracyIn: ci.accuracy,
+              checkInAt: checkInTime,
+              status: "checked_in",
+              isMocked: ciFinalMocked ? "yes" : "no",
+              suspicionScore: ciFinalMocked ? 100 : 0,
+              mockReasons: ciReasons.length > 0 ? JSON.stringify(ciReasons) : null,
+            }).$returningId();
+
+            // 🚨 لو الزيارة المتزامنة وهمية — ابعت إشعار للأدمن
+            if (ciFinalMocked) {
+              const managerName = await getManagerName(tx, ctx.user!.id);
+              notifyMockedCheckInOffline(managerName, branch.name, checkInTime, isTeleporting);
+            }
+
+            localToServerId.set(ci.localId, inserted.id);
+            synced++;
+          } catch (err) {
+            console.error("[syncOfflineVisits] checkIn error:", err);
             failedLocalIds.push(ci.localId);
-            rejected++;
-            continue;
           }
-
-          // ✅ check-in offline: فحص Teleportation + mock detection
-          const ciReasons: string[] = [];
-
-          let isTeleporting = false;
-          const checkInTime = new Date(ci.checkInAt);
-          const prevResult = await calcDistanceFromPrevBranch(
-            db, manager.id, ci.branchName,
-            parseFloat(branch.latitude), parseFloat(branch.longitude),
-            checkInTime
-          );
-          if (prevResult !== null && isTeleportation(prevResult.km, prevResult.timeDiffMin)) {
-            isTeleporting = true;
-            const speedKmh = Math.round(prevResult.km / (prevResult.timeDiffMin / 60));
-            ciReasons.push(`TELEPORTATION:${prevResult.prevBranchName}→${ci.branchName}:${prevResult.km.toFixed(1)}km:${Math.round(prevResult.timeDiffMin)}min:${speedKmh}kmh`);
-          }
-
-          const ciFinalMocked = ci.isMocked || isTeleporting;
-
-          await db.update(managers).set({ isActive: "yes" }).where(eq(managers.id, manager.id));
-
-          const [inserted] = await db.insert(visits).values({
-            managerId: manager.id,
-            branchId: ci.branchId,
-            latitudeIn: ci.latitude,
-            longitudeIn: ci.longitude,
-            accuracyIn: ci.accuracy,
-            checkInAt: checkInTime,
-            status: "checked_in",
-            isMocked: ciFinalMocked ? "yes" : "no",
-            suspicionScore: ciFinalMocked ? 100 : 0,
-            mockReasons: ciReasons.length > 0 ? JSON.stringify(ciReasons) : null,
-            distanceToPrevBranchKm: undefined,
-          }).$returningId();
-
-          // 🚨 لو الزيارة المتزامنة وهمية — ابعت إشعار للأدمن
-          if (ciFinalMocked) {
-            notifyOwner({
-              title: "🚨 زيارة وهمية مكتشفة (أوفلاين)",
-              content: `المدير: ${await getManagerName(db, ctx.user!.id)}\nالفرع: ${branch.name}\nوقت الدخول: ${checkInTime.toLocaleString("ar-EG")}\n${isTeleporting ? "تم اكتشاف انتقال غير منطقي (Teleportation)" : "تحديد موقع وهمي"}`,
-            }).catch(() => {});
-          }
-
-          localToServerId.set(ci.localId, inserted.id);
-          synced++;
-        } catch (err) {
-          console.error("[syncOfflineVisits] checkIn error:", err);
-          failedLocalIds.push(ci.localId);
         }
-      }
 
-      // ── 2. check-outs ─────────────────────────────────────────────────────
-      const checkOuts = input.visits.filter((v) => v.type === "check_out");
-      for (const co of checkOuts) {
-        try {
-          const visitId = localToServerId.get(co.localCheckInId)
-            ?? (co.serverVisitId ?? null);
+        // ── 2. check-outs ─────────────────────────────────────────────────────
+        const checkOuts = input.visits.filter((v) => v.type === "check_out");
+        for (const co of checkOuts) {
+          try {
+            const visitId = localToServerId.get(co.localCheckInId)
+              ?? (co.serverVisitId ?? null);
 
-          if (!visitId) { failedLocalIds.push(co.localCheckInId); continue; }
+            if (!visitId) { failedLocalIds.push(co.localCheckInId); continue; }
 
-          const visitRow = await db.select({
-            id: visits.id,
-            checkInAt: visits.checkInAt,
-            branchName: branches.name,
-            branchLatitude: branches.latitude,
-            branchLongitude: branches.longitude,
-          })
-            .from(visits)
-            .leftJoin(branches, eq(visits.branchId, branches.id))
-            .where(and(eq(visits.id, visitId), eq(visits.managerId, manager.id)))
-            .limit(1);
+            const visitRow = await tx.select({
+              id: visits.id,
+              checkInAt: visits.checkInAt,
+              branchName: branches.name,
+              branchLatitude: branches.latitude,
+              branchLongitude: branches.longitude,
+              // ✅ جايين مع الـ select الأصلي — finalizeCheckOut مش محتاجة استعلام إضافي
+              suspicionScore: visits.suspicionScore,
+              mockReasons: visits.mockReasons,
+            })
+              .from(visits)
+              .leftJoin(branches, eq(visits.branchId, branches.id))
+              .where(and(eq(visits.id, visitId), eq(visits.managerId, manager.id)))
+              .limit(1);
 
-          if (!visitRow[0]) continue;
+            if (!visitRow[0]) continue;
 
-          await finalizeCheckOut(db, manager.id, visitRow[0], new Date(co.checkOutAt));
-          synced++;
-        } catch (err) {
-          console.error("[syncOfflineVisits] checkOut error:", err);
+            await finalizeCheckOut(tx, manager.id, visitRow[0], new Date(co.checkOutAt));
+            synced++;
+          } catch (err) {
+            console.error("[syncOfflineVisits] checkOut error:", err);
+          }
         }
-      }
 
-      return { synced, rejected, failedLocalIds };
+        return { synced, rejected, failedLocalIds };
+      });
     }),
 
   // POST — sync offline tracking data
@@ -811,7 +759,6 @@ export const visitRouter = router({
     .mutation(async ({ input }) => {
       const db = await getDb();
       if (!db) throw new Error("Database not available");
-      
       const updateData: any = { ...input };
       updateData.checkInAt = new Date(input.checkInAt);
       if (input.checkOutAt) updateData.checkOutAt = new Date(input.checkOutAt);
@@ -836,7 +783,11 @@ export const visitRouter = router({
       if (!managerResult[0]) return { items: [], total: 0 };
       const managerId = managerResult[0].id;
 
-      const conditions: any[] = [eq(visits.managerId, managerId)];
+      const conditions: any[] = [
+        eq(visits.managerId, managerId),
+        // إخفاء المأموريات المرفوضة من تقرير المدير
+        or(ne(visits.visitType, "external_mission"), ne(visits.approvalStatus, "rejected")),
+      ];
       if (input.startDate) conditions.push(gte(visits.checkInAt, new Date(input.startDate)));
       if (input.endDate) {
         const end = new Date(input.endDate);

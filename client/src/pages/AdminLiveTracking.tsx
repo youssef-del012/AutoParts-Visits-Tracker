@@ -1,10 +1,15 @@
 import { trpc } from "@/lib/trpc";
 import { MapView, MapMarker, MapPolyline } from "@/components/Map";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { formatDistanceToNow } from "date-fns";
 import { ar } from "date-fns/locale";
 import type { MapCenter } from "@/components/Map";
 import { useLang } from "@/lib/i18n";
+import { getDistanceMeters } from "../../../shared/utils";
+
+// ── ثوابت عنقود التوقفات (Stops) — نقاط متتالية أقرب من 50م ومدة ≥ 5 دقايق = توقف ──
+const STOP_CLUSTER_RADIUS_M = 50;
+const STOP_MIN_DURATION_MIN = 5;
 
 export default function AdminLiveTracking() {
   const { t, lang } = useLang();
@@ -29,6 +34,43 @@ export default function AdminLiveTracking() {
     if (mode === "history" && routeHistory.length > 0)
       setFlyTo({ lat: parseFloat(routeHistory[0].latitude), lng: parseFloat(routeHistory[0].longitude) });
   }, [routeHistory, mode]);
+
+  // ── إحصاءات المسار (history mode): نقاط + مسافة + توقفات + مدة ─────────────
+  const routeStats = useMemo(() => {
+    const pts = routeHistory.map((p) => ({
+      lat: parseFloat(p.latitude),
+      lng: parseFloat(p.longitude),
+      ts: new Date(p.timestamp).getTime(),
+    }));
+    // المسافة الكلية: مجموع المسافات بين النقاط المتتالية
+    let totalMeters = 0;
+    for (let i = 1; i < pts.length; i++) {
+      totalMeters += getDistanceMeters(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng);
+    }
+    // عنقود التوقفات: نقاط متتالية كلها بأقل من 50م من أول نقطة في العنقود؛
+    // لو مدة العنقود (أول نقطة ← آخر نقطة) ≥ 5 دقايق يعتبر توقف والرحلة تنقسم عنده
+    const stops: { lat: number; lng: number; minutes: number }[] = [];
+    let i = 0;
+    while (i < pts.length) {
+      let j = i + 1;
+      while (j < pts.length && getDistanceMeters(pts[i].lat, pts[i].lng, pts[j].lat, pts[j].lng) < STOP_CLUSTER_RADIUS_M) j++;
+      const minutes = (pts[j - 1].ts - pts[i].ts) / 60000;
+      if (j - 1 > i && minutes >= STOP_MIN_DURATION_MIN) {
+        stops.push({ lat: pts[i].lat, lng: pts[i].lng, minutes: Math.round(minutes) });
+      }
+      i = j;
+    }
+    const durationMin = pts.length > 1 ? (pts[pts.length - 1].ts - pts[0].ts) / 60000 : 0;
+    return { pts, totalKm: totalMeters / 1000, stops, durationMin };
+  }, [routeHistory]);
+
+  const hUnit = t("time.hourShort");
+  const mUnit = t("time.minShort");
+  const fmtRouteDuration = (min: number): string => {
+    const m = Math.max(0, Math.round(min));
+    const h = Math.floor(m / 60);
+    return h > 0 ? `${h}${hUnit} ${m % 60}${mUnit}` : `${m}${mUnit}`;
+  };
 
   const withLoc    = managers.filter((m) => m.location !== null);
   const withoutLoc = managers.filter((m) => m.location === null);
@@ -148,13 +190,44 @@ export default function AdminLiveTracking() {
                     />
                   ))
                 : selectedManager && routeHistory.length > 0 && (
-                    <MapPolyline
-                      positions={routeHistory.map(
-                        (p) => [parseFloat(p.latitude), parseFloat(p.longitude)] as [number, number]
+                    <>
+                      {/* المسار الكامل — زي ما هو */}
+                      <MapPolyline
+                        positions={routeStats.pts.map(
+                          (p) => [p.lat, p.lng] as [number, number]
+                        )}
+                        color="#FFB020"
+                        weight={4}
+                      />
+                      {/* نقطة البداية (أخضر) ونقطة النهاية (أحمر) */}
+                      {routeStats.pts.length > 0 && (
+                        <MapMarker
+                          lat={routeStats.pts[0].lat}
+                          lng={routeStats.pts[0].lng}
+                          color="#22C55E"
+                          label={t("live.startPoint")}
+                        />
                       )}
-                      color="#FFB020"
-                      weight={4}
-                    />
+                      {routeStats.pts.length > 1 && (
+                        <MapMarker
+                          lat={routeStats.pts[routeStats.pts.length - 1].lat}
+                          lng={routeStats.pts[routeStats.pts.length - 1].lng}
+                          color="#EF4444"
+                          label={t("live.endPoint")}
+                        />
+                      )}
+                      {/* ماركرات التوقفات (برتقالي) */}
+                      {routeStats.stops.map((s, idx) => (
+                        <MapMarker
+                          key={`stop-${idx}`}
+                          lat={s.lat}
+                          lng={s.lng}
+                          color="#FFB020"
+                          label={t("live.stoppedFor", { n: s.minutes })}
+                          popupContent={t("live.stoppedFor", { n: s.minutes })}
+                        />
+                      ))}
+                    </>
                   )}
             </MapView>
 
@@ -172,6 +245,35 @@ export default function AdminLiveTracking() {
             )}
             {mode === "history" && selectedManager && !historyLoading && routeHistory.length === 0 && (
               <Overlay icon="wrong_location" title={t("live.noRoute")} sub={t("live.noRouteSub")} />
+            )}
+
+            {/* ── شريط ملخص المسار (history mode): مسافة + توقفات + مدة + نقاط ── */}
+            {mode === "history" && routeHistory.length > 0 && (
+              <div
+                className="absolute top-2.5 left-1/2 -translate-x-1/2 z-[1050] flex flex-wrap justify-center gap-1.5 px-2 max-w-[96%]"
+              >
+                {[
+                  { icon: "route", label: t("live.totalDistance"), value: `${routeStats.totalKm.toFixed(1)} ${t("reports.km")}` },
+                  { icon: "pause_circle", label: t("live.stopsCount"), value: String(routeStats.stops.length) },
+                  { icon: "schedule", label: t("live.duration"), value: fmtRouteDuration(routeStats.durationMin) },
+                  { icon: "timeline", label: t("live.pointsCount"), value: String(routeStats.pts.length) },
+                ].map((c) => (
+                  <span
+                    key={c.label}
+                    className="flex items-center gap-1.5 px-3 py-1.5 whitespace-nowrap"
+                    style={{
+                      background: "var(--adm-surface)",
+                      border: "1px solid var(--adm-border)",
+                      borderRadius: 999,
+                      boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+                    }}
+                  >
+                    <span className="material-symbols-outlined text-[14px] text-[var(--adm-text-3)]">{c.icon}</span>
+                    <span className="text-[11px] font-semibold text-[var(--adm-text-3)]">{c.label}</span>
+                    <span className="text-[11px] font-bold font-mono text-[var(--adm-text-1)]">{c.value}</span>
+                  </span>
+                ))}
+              </div>
             )}
           </div>
 
